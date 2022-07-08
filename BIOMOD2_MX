@@ -1,0 +1,334 @@
+
+setwd("C:\\01_MASTERS_2022/04_TESIS_MOD4/03_MOD_INFER/")
+
+library(rJava)
+library(glmulti)
+library(rlang)
+library(raster)
+library(parallel)
+library(reshape)
+library(ggplot2)
+library(biomod2)
+library(rgdal)
+library(maptools)
+library(sp)
+library(plyr)
+library(reshape)
+library(reshape2)
+library(nlme)
+library(mgcv)
+library(ascii)
+
+
+
+
+###################      1 - VARIABLE SELECTION: GLMULTI    ###########################
+
+
+
+
+var<-read.table("var.csv",header = TRUE,sep = ",")
+amph<-read.table("anf.csv",header = TRUE,sep = ",")
+xy=read.table("varxy.csv",header = TRUE,sep = ",")
+amph_nome<-levels(amph[,1]) #Save amphibian names 
+amphvar=matrix(ave(0,length(amph_nome)*27),length(amph_nome),27)#Build matrix
+
+for(i in 1:length(amph_nome)){#Create look that moves across the different species
+
+  aux=amph_nome[i]#Brings the name
+  aux2=which(amph[,1]==aux) #Get the line (grid in the map) where we have a SP recorded
+  aux3=amph[aux2,4] #Line's IDs 
+  pres_aus=rep(0,25958) #Register absence  
+  aux4=match(as.numeric(as.character(aux3)),as.numeric(as.character(var[,1])))
+  pres_aus[aux4]=1 #Place positive ocurrence
+  
+  amph_pr=glmulti(pres_aus~.,data=var[,-1], level=1 ,minsize = 4,maxsize = 10, fitfunc=glm, confsetsize=1 ,method="g")
+  aux5=names(amph_pr@objects[[1]][1]$coefficients[-1])#get variable names 
+  aux6=match(aux5,names(var)[(-1)])
+  
+  amphvar[i,aux6]=1
+}
+amph_vardef<-amphvar
+write.table(amph_vardef,file = "amph_vars2022.csv",sep = ',')
+
+
+
+########################    2 - MODELING: BIOMOD     ##################################
+
+############################     2.1 CALIBRATION
+
+#solution to installing packages in RStudio https://www.learngeom.com/2021/02/problem-installing-packages-in-rstudio.html
+
+var<-read.table("C:\\04_TESIS_MOD4/03_MOD_INFER/var.csv",header = TRUE,sep = ",")
+amph<-read.table("C:\\04_TESIS_MOD4/03_MOD_INFER/anf.csv",header = TRUE,sep = ",")
+xy=read.table("C:\\04_TESIS_MOD4/03_MOD_INFER/varxy.csv",header = TRUE,sep = ",")
+amphvar<-read.table("amph_vars2022.csv",header = TRUE,sep = ",")
+amph_nome<-levels(amph[,1]) #Save species name
+
+for(i in 1:length(amph_nome)){#loop base in the length of number listed species  
+  #Get specie to work with
+    aux=amph_nome[i]
+  #Get all the specie[i] "lines" from the species occurrences file 
+    aux2=which(amph[,1]==aux)  
+  #Get PRECENCE GRID ID of specie[i] from the species occurrences file
+    aux3=amph[aux2,4]  
+  #Create a absence only object, here you have the number of grid-cell you are working with(the 10x10km)
+    pres_aus=rep(0,25958) 
+  #match specie[i] ocurrences grid ID and variable grid ID
+    aux4=match(as.numeric(as.character(aux3)),as.numeric(as.character(var[,1]))) 
+  #assighn presence as value 1 where we have a match between specie and variable
+    pres_aus[aux4]=1 
+  #Eliminate the use of altitude by assiging 0  
+    amphvar[i,1]=0
+  #Get variable set for specie[i]
+    aux7= amphvar[i,]
+ 
+  
+  DataBIOMOD <-cbind(var[,-1][,aux7==1],pres_aus) #reference database to later test models.
+  aux8=paste("SPAV",i,sep ="")
+  aux9=dim(DataBIOMOD)[2]
+  names(DataBIOMOD)[aux9]=aux8
+  
+  
+  biofor=BIOMOD_FormatingData( #Data Rearrangement to be read in calibration
+    resp.var=DataBIOMOD[,aux9],
+    expl.var=DataBIOMOD[,1:(aux9-1)],
+    resp.xy=xy,
+    resp.name=aux,
+    PA.nb.absences = 10000, #set up changed, and recommended N 
+    eval.resp.var = NULL,
+    eval.expl.var = NULL,
+    PA.strategy = "random"
+    
+  )
+  #SET THE MODELS
+  biooptions=BIOMOD_ModelingOptions()
+  
+  
+  bmodout=BIOMOD_Modeling(biofor,models = c("GLM","GAM","CTA","ANN",
+                                            "GBM","FDA","SRE","MAXENT.Phillips"), #select models
+                          models.options = biooptions,NbRunEval=10, #indicate number of runs of all the models
+                          DataSplit=70, #Evaluation data divide 70-30%
+                          models.eval.meth = c("TSS"), #Evaluation method
+                          SaveObj = TRUE,
+                          do.full.models = FALSE)
+  
+  bioensem=BIOMOD_EnsembleModeling(bmodout,chosen.models ="all", #how many models will be used to create the ensamble
+                                    em.by = "PA_dataset+repet", #
+                                    eval.metric = "all",
+                                    eval.metric.quality.threshold = NULL,
+                                    models.eval.meth = "TSS", #ensemble using evaluation scores from TSS
+                                    prob.mean = FALSE, prob.cv = FALSE,
+                                    prob.ci = FALSE, 
+                                    prob.ci.alpha = 0.05, #use evaluation methods over this alpha
+                                    prob.median = FALSE,
+                                    committee.averaging = FALSE,
+                                    prob.mean.weight = TRUE,
+                                    prob.mean.weight.decay = "proportional",
+                                    VarImport = 0)
+  
+  assign(paste("bmodout_",i,sep = ""),bmodout)
+  assign(paste("bioensem_",i,sep = ""),bioensem)
+} #Process finished
+
+get_evaluations(bmodout_1)
+
+
+############################  2.1.1 Verify calibration results 
+############################  by creating maps and looking at evaluation files
+
+
+#Create calibration maps to verify results have been produce 
+for (k in 1:10){ #specie
+  borr2=get_predictions(get(paste("bmodout_",k,sep = "")))
+  for (i in 1:8) {#N models
+    for (j in 1:10){#N model runs
+      xyaux1 = cbind(xy, borr2[,i,j,1])
+      filename=paste("01_calibration/bmodout_",amph_nome[i],k,i,j,"z",sep = "")
+      jpeg(file=filename)
+      plot(xy,col=borr2[,i,j,1],cex=.3,pch=14)
+      dev.off()    }  }}
+
+get_evaluations(bmodout_1) #Review scores
+
+#get PREDICTION scores and write in a table
+for (n in 1:10){
+  grtpred=get_predictions(get(paste("bmodout_",n,sep = "")))
+  write.table(grtpred,paste("03_bmodout/bmodout_pred_",n,amph_nome[n],".csv",sep = ""),sep = ",") }
+
+#get EVALUATION scores and write in a table
+for (n in 1:10){
+  grtpred=get_evaluations(get(paste("bmodout_",n,sep = "")))
+  write.csv(grtpred,paste("02_bmodeval/bmodout_eval_",n,amph_nome[n],".csv",sep = ""),sep = ",") }
+
+
+
+############################     2.2 PROJECT      
+#remember to change names of the folders every time you run a different time 
+##this should include the name variables exactly as in DataBiomod
+DataBiomod_statePST=read.table("var1x1_past.csv",header = TRUE,sep = ",")
+
+ls(DataBiomod_statePST)
+XY_state=read.table("xy_1x1.csv",header = TRUE,sep = ",")
+ls(XY_state)
+names(DataBiomod_statePST)==names(var)#Verify that columns have the same name 
+
+##############################      PAST
+for(i in 1:length(amph_nome)){
+  
+  amphvar[i,1]=0 #eliminate altitude  
+  aux7=amphvar[i,]
+  DataBiomod_state1= DataBiomod_statePST[,-1]
+  DataBiomod_state1=DataBiomod_state1[,aux7==1]
+  names(DataBiomod_state1)
+  aux8=paste("SPAV",i,sep ="")
+  
+  bmodout=get(paste("bmodout_",i,sep=""))
+  bioensem=get(paste("bioensem_",i,sep=""))
+  
+  bioproj=BIOMOD_Projection( #calling function to project using BMODOUT from calibration 
+    modeling.output=bmodout,
+    proj.name=paste("projamph_PT",i,sep = ""),
+    new.env= DataBiomod_state1, #bring the variables at 1x1 
+    selected.models = "all", #added from the original file to bring all models
+    xy.new.env= XY_state[,-1],
+    binary.meth="TSS", 
+    build.clamping.mask = TRUE,#creates an additional map of uncertainty predictions
+    output.format=".RData")
+  
+  assign(paste("bioproj_PT_",i,sep = ""),bioproj)
+  
+  bioEF=BIOMOD_EnsembleForecasting( #function to consolidate the ensemble model from 8 to 1
+    projection.output=bioproj, #brings the projected output
+      EM.output=bioensem) #brings the ensemble score from calibration
+  
+  assign(paste("bioEF_PT_",i,sep = ""),bioEF) 
+  
+}
+
+##############################      CURRENT 2010
+
+DataBiomod_statePR=read.table("var1x1_pres.csv",header = TRUE,sep = ",") 
+names(DataBiomod_statePR)==names(var)
+
+for(i in 1:length(amph_nome)){
+  
+  amphvar[i,1]=0 
+  aux7=amphvar[i,]
+  DataBiomod_state1= DataBiomod_statePR[,-1]
+  DataBiomod_state1=DataBiomod_state1[,aux7==1]
+  names(DataBiomod_state1)
+  aux8=paste("SPAV",i,sep ="")
+  bmodout=get(paste("bmodout_",i,sep=""))
+  bioensem=get(paste("bioensem_",i,sep=""))
+  
+  bioproj=BIOMOD_Projection(
+    modeling.output=bmodout,
+    proj.name=paste("projamph_PR",i,sep = ""),
+    new.env= DataBiomod_state1,
+    selected.models = "all", 
+    xy.new.env= XY_state[,-1],
+    binary.meth="TSS", 
+    build.clamping.mask = TRUE,
+    output.format=".RData")
+  
+  assign(paste("bioproj_PR_",i,sep = ""),bioproj)
+  
+  bioEF=BIOMOD_EnsembleForecasting(
+    projection.output=bioproj,
+    EM.output=bioensem)
+  
+  assign(paste("bioEF_PR_",i,sep = ""),bioEF)
+  
+}
+
+##############################      FUTURE 2030 RCP85
+
+DataBiomod_stateF85=read.table("var1x1_fut85.csv",header = TRUE,sep = ",")
+names(DataBiomod_stateF85)==names(var)
+
+for(i in 1:length(amph_nome)){
+  
+  amphvar[i,1]=0 
+  aux7=amphvar[i,]
+  DataBiomod_state1= DataBiomod_stateF85[,-1]
+  DataBiomod_state1=DataBiomod_state1[,aux7==1]
+  names(DataBiomod_state1)
+  aux8=paste("SPAV",i,sep ="")
+  
+  bmodout=get(paste("bmodout_",i,sep=""))
+  bioensem=get(paste("bioensem_",i,sep=""))
+  
+  
+  bioproj=BIOMOD_Projection(
+    modeling.output=bmodout,
+    proj.name=paste("projamph_F85",i,sep = ""),
+    new.env= DataBiomod_state1,
+    selected.models = "all", 
+    xy.new.env= XY_state[,-1],
+    binary.meth="TSS", 
+    build.clamping.mask = TRUE,
+    output.format=".RData")
+  
+  assign(paste("bioproj_F85_",i,sep = ""),bioproj)
+  
+  bioEF=BIOMOD_EnsembleForecasting(
+    projection.output=bioproj,
+    EM.output=bioensem)
+  
+  assign(paste("bioEF_F85_",i,sep = ""),bioEF)
+  
+}
+
+############################  2.2.1 Verify projections results 
+############################  by looking at evaluation files
+
+for (n in 1:length(amph_nome)){ 
+  bout=get(paste("bmodout_",n,sep = ""))
+  geval=get_evaluations(bout)
+  head(geval)
+  geval2=geval[,1,,,]
+  write.table(geval2,paste("ANF\\TSS","_",amph_nome[n],".csv",sep = ""),sep = ",") 
+}
+
+#Create similar object with a period separation between species name, so it can read the required files 
+amph_nome2 =c("Ambystoma.altamirani",         "Ambystoma.granulosum" ,       
+              "Ambystoma.lermaense",          "Ambystoma.mexicanum" ,        
+              "Chiropterotriton.chiropterus", "Craugastor.hobartsmithi" ,    
+              "Pseudoeurycea.bellii",         "Pseudoeurycea.cephalica",     
+              "Pseudoeurycea.longicauda",     "Pseudoeurycea.robertsi")  
+
+for(i in 1:length(amph_nome2)){ 
+  m=rep(1:8,each=10) 
+  r=rep(1:10,times=8)
+  bout=get(paste("bmodout_",i,sep = ""))
+  geval=get_evaluations(bout)
+  head(geval)
+  
+  A=paste("ANF\\",amph_nome2[i],"\\proj_projamph_F85",i,"\\proj_projamph_F85",i,"_",amph_nome2[i],".RData",sep="")
+  load(A)
+  
+  A=paste("proj_projamph_F85",i,"_",amph_nome2[i],sep = "")
+  A=get(A)
+  meanmap=rep(0,93832)
+  
+  
+  
+  for (j in 1:80) {
+    
+    b=A[(93832*(j-1)+1):(93832*(j-1)+93832)]
+    btss=geval[1,1,m[j],r[j],1] 
+    weightb=b*btss
+    d=rbind(meanmap,weightb)
+    meanmap=colSums(d,na.rm = TRUE)
+  }
+  
+  tsssum=sum(geval[1,1,,,],na.rm = TRUE)
+  tssmapf45=meanmap/tsssum
+  assign(paste("mapF85_",amph_nome2[i],sep = ""),tssmapf45)
+}#}
+
+mapF85_Ambystoma.altamirani #The files produced will be use to create maps
+
+#SAVE MODELS
+save.image("SP_MODELS.RData")
